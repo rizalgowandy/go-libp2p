@@ -3,9 +3,10 @@ package peer_test
 import (
 	"testing"
 
-	ma "github.com/multiformats/go-multiaddr"
-
 	. "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/stretchr/testify/require"
+
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 var (
@@ -19,7 +20,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-	maddrPeer = ma.StringCast("/p2p/" + Encode(testID))
+	maddrPeer = ma.StringCast("/p2p/" + testID.String())
 	maddrTpt = ma.StringCast("/ip4/127.0.0.1/tcp/1234")
 	maddrFull = maddrTpt.Encapsulate(maddrPeer)
 }
@@ -48,6 +49,19 @@ func TestSplitAddr(t *testing.T) {
 	if id != "" {
 		t.Fatal("expected no peer ID")
 	}
+}
+
+func TestIDFromP2PAddr(t *testing.T) {
+	id, err := IDFromP2PAddr(maddrFull)
+	require.NoError(t, err)
+	require.Equal(t, testID, id)
+
+	id, err = IDFromP2PAddr(maddrPeer)
+	require.NoError(t, err)
+	require.Equal(t, testID, id)
+
+	_, err = IDFromP2PAddr(maddrTpt)
+	require.ErrorIs(t, err, ErrInvalidAddr)
 }
 
 func TestAddrInfoFromP2pAddr(t *testing.T) {
@@ -115,7 +129,7 @@ func TestAddrInfosFromP2pAddrs(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, info := range infos {
-		exaddrs, ok := expected[info.ID.Pretty()]
+		exaddrs, ok := expected[info.ID.String()]
 		if !ok {
 			t.Fatalf("didn't expect peer %s", info.ID)
 		}
@@ -129,7 +143,7 @@ func TestAddrInfosFromP2pAddrs(t *testing.T) {
 				t.Fatalf("expected %s, got %s", exaddrs[i], addr)
 			}
 		}
-		delete(expected, info.ID.Pretty())
+		delete(expected, info.ID.String())
 	}
 }
 
@@ -144,7 +158,7 @@ func TestAddrInfoJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	if addrInfo.ID != testID {
-		t.Fatalf("expected ID to equal %s, got %s", testID.Pretty(), addrInfo.ID.Pretty())
+		t.Fatalf("expected ID to equal %s, got %s", testID, addrInfo.ID)
 	}
 	if len(addrInfo.Addrs) != 1 || !addrInfo.Addrs[0].Equal(maddrFull) {
 		t.Fatalf("expected addrs to match %v, got %v", maddrFull, addrInfo.Addrs)

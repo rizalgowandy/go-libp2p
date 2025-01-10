@@ -11,6 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/transport"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcpreuse"
 
 	ma "github.com/multiformats/go-multiaddr"
 	mafmt "github.com/multiformats/go-multiaddr-fmt"
@@ -87,11 +88,13 @@ type WebsocketTransport struct {
 
 	tlsClientConf *tls.Config
 	tlsConf       *tls.Config
+
+	sharedTcp *tcpreuse.ConnMgr
 }
 
 var _ transport.Transport = (*WebsocketTransport)(nil)
 
-func New(u transport.Upgrader, rcmgr network.ResourceManager, opts ...Option) (*WebsocketTransport, error) {
+func New(u transport.Upgrader, rcmgr network.ResourceManager, sharedTCP *tcpreuse.ConnMgr, opts ...Option) (*WebsocketTransport, error) {
 	if rcmgr == nil {
 		rcmgr = &network.NullResourceManager{}
 	}
@@ -99,6 +102,7 @@ func New(u transport.Upgrader, rcmgr network.ResourceManager, opts ...Option) (*
 		upgrader:      u,
 		rcmgr:         rcmgr,
 		tlsClientConf: &tls.Config{},
+		sharedTcp:     sharedTCP,
 	}
 	for _, opt := range opts {
 		if err := opt(t); err != nil {
@@ -120,7 +124,7 @@ func (t *WebsocketTransport) Proxy() bool {
 	return false
 }
 
-func (t *WebsocketTransport) Resolve(ctx context.Context, maddr ma.Multiaddr) ([]ma.Multiaddr, error) {
+func (t *WebsocketTransport) Resolve(_ context.Context, maddr ma.Multiaddr) ([]ma.Multiaddr, error) {
 	parsed, err := parseWebsocketMultiaddr(maddr)
 	if err != nil {
 		return nil, err
@@ -133,10 +137,10 @@ func (t *WebsocketTransport) Resolve(ctx context.Context, maddr ma.Multiaddr) ([
 
 	if parsed.sni == nil {
 		var err error
-		// We don't have an sni component, we'll use dns/dnsaddr
+		// We don't have an sni component, we'll use dns
 		ma.ForEach(parsed.restMultiaddr, func(c ma.Component) bool {
 			switch c.Protocol().Code {
-			case ma.P_DNS, ma.P_DNS4, ma.P_DNS6, ma.P_DNSADDR:
+			case ma.P_DNS, ma.P_DNS4, ma.P_DNS6:
 				// err shouldn't happen since this means we couldn't parse a dns hostname for an sni value.
 				parsed.sni, err = ma.NewComponent("sni", c.Value())
 				return false
@@ -229,7 +233,11 @@ func (t *WebsocketTransport) maDial(ctx context.Context, raddr ma.Multiaddr) (ma
 }
 
 func (t *WebsocketTransport) maListen(a ma.Multiaddr) (manet.Listener, error) {
-	l, err := newListener(a, t.tlsConf)
+	var tlsConf *tls.Config
+	if t.tlsConf != nil {
+		tlsConf = t.tlsConf.Clone()
+	}
+	l, err := newListener(a, tlsConf, t.sharedTcp)
 	if err != nil {
 		return nil, err
 	}

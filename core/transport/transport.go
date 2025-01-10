@@ -5,6 +5,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -49,6 +50,10 @@ type CapableConn interface {
 // shutdown. NOTE: `Dial` and `Listen` may be called after or concurrently with
 // `Close`.
 //
+// In addition to the Transport interface, transports may implement
+// Resolver or SkipResolver interface. When wrapping/embedding a transport, you should
+// ensure that the Resolver/SkipResolver interface is handled correctly.
+//
 // For a conceptual overview, see https://docs.libp2p.io/concepts/transport/
 type Transport interface {
 	// Dial dials a remote peer. It should try to reuse local listener
@@ -82,6 +87,14 @@ type Transport interface {
 // multiaddr.
 type Resolver interface {
 	Resolve(ctx context.Context, maddr ma.Multiaddr) ([]ma.Multiaddr, error)
+}
+
+// SkipResolver can be optionally implemented by transports that don't want to
+// resolve or transform the multiaddr. Useful for transports that indirectly
+// wrap other transports (e.g. p2p-circuit). This lets the inner transport
+// specify how a multiaddr is resolved later.
+type SkipResolver interface {
+	SkipResolve(ctx context.Context, maddr ma.Multiaddr) bool
 }
 
 // Listener is an interface closely resembling the net.Listener interface. The
@@ -123,4 +136,48 @@ type Upgrader interface {
 	UpgradeListener(Transport, manet.Listener) Listener
 	// Upgrade upgrades the multiaddr/net connection into a full libp2p-transport connection.
 	Upgrade(ctx context.Context, t Transport, maconn manet.Conn, dir network.Direction, p peer.ID, scope network.ConnManagementScope) (CapableConn, error)
+}
+
+// DialUpdater provides updates on in progress dials.
+type DialUpdater interface {
+	// DialWithUpdates dials a remote peer and provides updates on the passed channel.
+	DialWithUpdates(context.Context, ma.Multiaddr, peer.ID, chan<- DialUpdate) (CapableConn, error)
+}
+
+// DialUpdateKind indicates the type of DialUpdate event.
+type DialUpdateKind int
+
+const (
+	// UpdateKindDialFailed indicates dial failed.
+	UpdateKindDialFailed DialUpdateKind = iota
+	// UpdateKindDialSuccessful indicates dial succeeded.
+	UpdateKindDialSuccessful
+	// UpdateKindHandshakeProgressed indicates successful completion of the TCP 3-way
+	// handshake
+	UpdateKindHandshakeProgressed
+)
+
+func (k DialUpdateKind) String() string {
+	switch k {
+	case UpdateKindDialFailed:
+		return "DialFailed"
+	case UpdateKindDialSuccessful:
+		return "DialSuccessful"
+	case UpdateKindHandshakeProgressed:
+		return "UpdateKindHandshakeProgressed"
+	default:
+		return fmt.Sprintf("DialUpdateKind<Unknown-%d>", k)
+	}
+}
+
+// DialUpdate is used by DialUpdater to provide dial updates.
+type DialUpdate struct {
+	// Kind is the kind of update event.
+	Kind DialUpdateKind
+	// Addr is the peer's address.
+	Addr ma.Multiaddr
+	// Conn is the resulting connection on success.
+	Conn CapableConn
+	// Err is the reason for dial failure.
+	Err error
 }
