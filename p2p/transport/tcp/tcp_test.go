@@ -14,11 +14,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	tptu "github.com/libp2p/go-libp2p/p2p/net/upgrader"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcpreuse"
 	ttransport "github.com/libp2p/go-libp2p/p2p/transport/testsuite"
 
-	"github.com/golang/mock/gomock"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 var muxers = []tptu.StreamMuxer{{ID: "/yamux", Muxer: yamux.DefaultTransport}}
@@ -30,19 +32,19 @@ func TestTcpTransport(t *testing.T) {
 
 		ua, err := tptu.New(ia, muxers, nil, nil, nil)
 		require.NoError(t, err)
-		ta, err := NewTCPTransport(ua, nil)
+		ta, err := NewTCPTransport(ua, nil, nil)
 		require.NoError(t, err)
 		ub, err := tptu.New(ib, muxers, nil, nil, nil)
 		require.NoError(t, err)
-		tb, err := NewTCPTransport(ub, nil)
+		tb, err := NewTCPTransport(ub, nil, nil)
 		require.NoError(t, err)
 
 		zero := "/ip4/127.0.0.1/tcp/0"
 		ttransport.SubtestTransport(t, ta, tb, zero, peerA)
 
-		envReuseportVal = false
+		tcpreuse.EnvReuseportVal = false
 	}
-	envReuseportVal = true
+	tcpreuse.EnvReuseportVal = true
 }
 
 func TestTcpTransportWithMetrics(t *testing.T) {
@@ -51,11 +53,11 @@ func TestTcpTransportWithMetrics(t *testing.T) {
 
 	ua, err := tptu.New(ia, muxers, nil, nil, nil)
 	require.NoError(t, err)
-	ta, err := NewTCPTransport(ua, nil, WithMetrics())
+	ta, err := NewTCPTransport(ua, nil, nil, WithMetrics())
 	require.NoError(t, err)
 	ub, err := tptu.New(ib, muxers, nil, nil, nil)
 	require.NoError(t, err)
-	tb, err := NewTCPTransport(ub, nil, WithMetrics())
+	tb, err := NewTCPTransport(ub, nil, nil, WithMetrics())
 	require.NoError(t, err)
 
 	zero := "/ip4/127.0.0.1/tcp/0"
@@ -71,7 +73,7 @@ func TestResourceManager(t *testing.T) {
 
 	ua, err := tptu.New(ia, muxers, nil, nil, nil)
 	require.NoError(t, err)
-	ta, err := NewTCPTransport(ua, nil)
+	ta, err := NewTCPTransport(ua, nil, nil)
 	require.NoError(t, err)
 	ln, err := ta.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
 	require.NoError(t, err)
@@ -80,7 +82,7 @@ func TestResourceManager(t *testing.T) {
 	ub, err := tptu.New(ib, muxers, nil, nil, nil)
 	require.NoError(t, err)
 	rcmgr := mocknetwork.NewMockResourceManager(ctrl)
-	tb, err := NewTCPTransport(ub, rcmgr)
+	tb, err := NewTCPTransport(ub, rcmgr, nil)
 	require.NoError(t, err)
 
 	t.Run("success", func(t *testing.T) {
@@ -118,16 +120,16 @@ func TestTcpTransportCantDialDNS(t *testing.T) {
 		require.NoError(t, err)
 
 		var u transport.Upgrader
-		tpt, err := NewTCPTransport(u, nil)
+		tpt, err := NewTCPTransport(u, nil, nil)
 		require.NoError(t, err)
 
 		if tpt.CanDial(dnsa) {
 			t.Fatal("shouldn't be able to dial dns")
 		}
 
-		envReuseportVal = false
+		tcpreuse.EnvReuseportVal = false
 	}
-	envReuseportVal = true
+	tcpreuse.EnvReuseportVal = true
 }
 
 func TestTcpTransportCantListenUtp(t *testing.T) {
@@ -136,15 +138,63 @@ func TestTcpTransportCantListenUtp(t *testing.T) {
 		require.NoError(t, err)
 
 		var u transport.Upgrader
-		tpt, err := NewTCPTransport(u, nil)
+		tpt, err := NewTCPTransport(u, nil, nil)
 		require.NoError(t, err)
 
 		_, err = tpt.Listen(utpa)
 		require.Error(t, err, "shouldn't be able to listen on utp addr with tcp transport")
 
-		envReuseportVal = false
+		tcpreuse.EnvReuseportVal = false
 	}
-	envReuseportVal = true
+	tcpreuse.EnvReuseportVal = true
+}
+
+func TestDialWithUpdates(t *testing.T) {
+	peerA, ia := makeInsecureMuxer(t)
+	_, ib := makeInsecureMuxer(t)
+
+	ua, err := tptu.New(ia, muxers, nil, nil, nil)
+	require.NoError(t, err)
+	ta, err := NewTCPTransport(ua, nil, nil)
+	require.NoError(t, err)
+	ln, err := ta.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ub, err := tptu.New(ib, muxers, nil, nil, nil)
+	require.NoError(t, err)
+	tb, err := NewTCPTransport(ub, nil, nil)
+	require.NoError(t, err)
+
+	updCh := make(chan transport.DialUpdate, 1)
+	conn, err := tb.DialWithUpdates(context.Background(), ln.Multiaddr(), peerA, updCh)
+	upd := <-updCh
+	require.Equal(t, transport.UpdateKindHandshakeProgressed, upd.Kind)
+	require.NotNil(t, conn)
+	require.NoError(t, err)
+
+	acceptAndClose := func() manet.Listener {
+		li, err := manet.Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			conn, err := li.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}()
+		return li
+	}
+	li := acceptAndClose()
+	defer li.Close()
+	// This dial will fail as acceptAndClose will not upgrade the connection
+	conn, err = tb.DialWithUpdates(context.Background(), li.Multiaddr(), peerA, updCh)
+	upd = <-updCh
+	require.Equal(t, transport.UpdateKindHandshakeProgressed, upd.Kind)
+	require.Nil(t, conn)
+	require.Error(t, err)
 }
 
 func makeInsecureMuxer(t *testing.T) (peer.ID, []sec.SecureTransport) {

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -28,7 +29,6 @@ import (
 	libp2pwebtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 
 	"github.com/benbjohnson/clock"
-	"github.com/golang/mock/gomock"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-multibase"
@@ -37,6 +37,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 const clockSkewAllowance = time.Hour
@@ -97,7 +98,7 @@ func getCerthashComponent(t *testing.T, b []byte) ma.Multiaddr {
 
 func newConnManager(t *testing.T, opts ...quicreuse.Option) *quicreuse.ConnManager {
 	t.Helper()
-	cm, err := quicreuse.NewConnManager([32]byte{}, opts...)
+	cm, err := quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{}, opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { cm.Close() })
 	return cm
@@ -178,7 +179,11 @@ func TestHashVerification(t *testing.T) {
 		var trErr *quic.TransportError
 		require.ErrorAs(t, err, &trErr)
 		require.Equal(t, quic.TransportErrorCode(0x12a), trErr.ErrorCode)
-		require.Contains(t, trErr.ErrorMessage, "cert hash not found")
+		var errMismatchHash libp2pwebtransport.ErrCertHashMismatch
+		require.ErrorAs(t, err, &errMismatchHash)
+
+		e := sha256.Sum256([]byte("foobar"))
+		require.EqualValues(t, e[:], errMismatchHash.Actual[0])
 	})
 
 	t.Run("fails when adding a wrong hash", func(t *testing.T) {
@@ -360,7 +365,7 @@ func TestResourceManagerListening(t *testing.T) {
 }
 
 // TODO: unify somehow. We do the same in libp2pquic.
-//go:generate sh -c "go run github.com/golang/mock/mockgen -package libp2pwebtransport_test -destination mock_connection_gater_test.go github.com/libp2p/go-libp2p/core/connmgr ConnectionGater && go run golang.org/x/tools/cmd/goimports -w mock_connection_gater_test.go"
+//go:generate sh -c "go run go.uber.org/mock/mockgen -package libp2pwebtransport_test -destination mock_connection_gater_test.go github.com/libp2p/go-libp2p/core/connmgr ConnectionGater && go run golang.org/x/tools/cmd/goimports -w mock_connection_gater_test.go"
 
 func TestConnectionGaterDialing(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -650,7 +655,7 @@ func serverSendsBackValidCert(t *testing.T, timeSinceUnixEpoch time.Duration, ke
 	}
 
 	// Bound this to 100 years
-	timeSinceUnixEpoch = time.Duration(timeSinceUnixEpoch % (time.Hour * 24 * 365 * 100))
+	timeSinceUnixEpoch = timeSinceUnixEpoch % (time.Hour * 24 * 365 * 100)
 	// Start a bit further in the future to avoid edge cases around epoch
 	timeSinceUnixEpoch += time.Hour * 24 * 365
 	start := time.UnixMilli(timeSinceUnixEpoch.Milliseconds())
@@ -729,7 +734,7 @@ func TestServerRotatesCertCorrectly(t *testing.T) {
 		}
 
 		// Bound this to 100 years
-		timeSinceUnixEpoch = time.Duration(timeSinceUnixEpoch % (time.Hour * 24 * 365 * 100))
+		timeSinceUnixEpoch = timeSinceUnixEpoch % (time.Hour * 24 * 365 * 100)
 		// Start a bit further in the future to avoid edge cases around epoch
 		timeSinceUnixEpoch += time.Hour * 24 * 365
 		start := time.UnixMilli(timeSinceUnixEpoch.Milliseconds())
@@ -826,4 +831,36 @@ func TestServerRotatesCertCorrectlyAfterSteps(t *testing.T) {
 
 		require.True(t, found, "Failed after hour: %v", i)
 	}
+}
+
+func TestH3ConnClosed(t *testing.T) {
+	_, serverKey := newIdentity(t)
+	tr, err := libp2pwebtransport.New(serverKey, nil, newConnManager(t), nil, nil, libp2pwebtransport.WithHandshakeTimeout(1*time.Second))
+	require.NoError(t, err)
+	defer tr.(io.Closer).Close()
+	ln, err := tr.Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport"))
+	require.NoError(t, err)
+	defer ln.Close()
+
+	p, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	conn, err := quic.Dial(context.Background(), p, ln.Addr(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{http3.NextProtoH3},
+	}, nil)
+	require.NoError(t, err)
+	rt := &http3.Transport{}
+	rt.NewClientConn(conn)
+	require.Eventually(t, func() bool {
+		c := http.Client{
+			Transport: rt,
+			Timeout:   1 * time.Second,
+		}
+		resp, err := c.Get(fmt.Sprintf("https://%s", ln.Addr().String()))
+		if err != nil {
+			return true
+		}
+		resp.Body.Close()
+		return false
+	}, 10*time.Second, 1*time.Second)
 }

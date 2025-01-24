@@ -61,6 +61,24 @@ func SplitAddr(m ma.Multiaddr) (transport ma.Multiaddr, id ID) {
 	return transport, id
 }
 
+// IDFromP2PAddr extracts the peer ID from a p2p Multiaddr
+func IDFromP2PAddr(m ma.Multiaddr) (ID, error) {
+	if m == nil {
+		return "", ErrInvalidAddr
+	}
+	var lastComponent ma.Component
+	ma.ForEach(m, func(c ma.Component) bool {
+		lastComponent = c
+		return true
+	})
+	if lastComponent.Protocol().Code != ma.P_P2P {
+		return "", ErrInvalidAddr
+	}
+
+	id := ID(lastComponent.RawValue()) // already validated by the multiaddr library.
+	return id, nil
+}
+
 // AddrInfoFromString builds an AddrInfo from the string representation of a Multiaddr
 func AddrInfoFromString(s string) (*AddrInfo, error) {
 	a, err := ma.NewMultiaddr(s)
@@ -86,7 +104,7 @@ func AddrInfoFromP2pAddr(m ma.Multiaddr) (*AddrInfo, error) {
 
 // AddrInfoToP2pAddrs converts an AddrInfo to a list of Multiaddrs.
 func AddrInfoToP2pAddrs(pi *AddrInfo) ([]ma.Multiaddr, error) {
-	p2ppart, err := ma.NewComponent("p2p", Encode(pi.ID))
+	p2ppart, err := ma.NewComponent("p2p", pi.ID.String())
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +120,7 @@ func AddrInfoToP2pAddrs(pi *AddrInfo) ([]ma.Multiaddr, error) {
 
 func (pi *AddrInfo) Loggable() map[string]interface{} {
 	return map[string]interface{}{
-		"peerID": pi.ID.Pretty(),
+		"peerID": pi.ID.String(),
 		"addrs":  pi.Addrs,
 	}
 }

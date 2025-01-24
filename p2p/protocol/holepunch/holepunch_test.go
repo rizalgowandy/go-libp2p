@@ -3,6 +3,7 @@ package holepunch_test
 import (
 	"context"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -94,10 +95,9 @@ func TestNoHolePunchIfDirectConnExists(t *testing.T) {
 	require.GreaterOrEqual(t, nc1, 1)
 	nc2 := len(h2.Network().ConnsToPeer(h1.ID()))
 	require.GreaterOrEqual(t, nc2, 1)
-
 	require.NoError(t, hps.DirectConnect(h2.ID()))
-	require.Equal(t, len(h1.Network().ConnsToPeer(h2.ID())), nc1)
-	require.Equal(t, len(h2.Network().ConnsToPeer(h1.ID())), nc2)
+	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), nc1)
+	require.Len(t, h2.Network().ConnsToPeer(h1.ID()), nc2)
 	require.Empty(t, tr.getEvents())
 }
 
@@ -120,13 +120,13 @@ func TestDirectDialWorks(t *testing.T) {
 	h1.Peerstore().AddAddrs(h2.ID(), h2.Addrs(), peerstore.ConnectedAddrTTL)
 
 	// try to hole punch without any connection and streams, if it works -> it's a direct connection
-	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), 0)
+	require.Empty(t, h1.Network().ConnsToPeer(h2.ID()))
 	require.NoError(t, h1ps.DirectConnect(h2.ID()))
 	require.GreaterOrEqual(t, len(h1.Network().ConnsToPeer(h2.ID())), 1)
 	require.GreaterOrEqual(t, len(h2.Network().ConnsToPeer(h1.ID())), 1)
 	events := tr.getEvents()
 	require.Len(t, events, 1)
-	require.Equal(t, events[0].Type, holepunch.DirectDialEvtT)
+	require.Equal(t, holepunch.DirectDialEvtT, events[0].Type)
 }
 
 func TestEndToEndSimConnect(t *testing.T) {
@@ -247,7 +247,6 @@ func TestFailuresOnInitiator(t *testing.T) {
 				require.Contains(t, err.Error(), tc.errMsg)
 			}
 		})
-
 	}
 }
 
@@ -340,7 +339,7 @@ func TestFailuresOnResponder(t *testing.T) {
 			defer h2.Close()
 			defer relay.Close()
 
-			s, err := h2.NewStream(network.WithUseTransient(context.Background(), "holepunch"), h1.ID(), holepunch.Protocol)
+			s, err := h2.NewStream(network.WithAllowLimitedConn(context.Background(), "holepunch"), h1.ID(), holepunch.Protocol)
 			require.NoError(t, err)
 
 			go tc.initiator(s)
@@ -361,7 +360,6 @@ func TestFailuresOnResponder(t *testing.T) {
 			require.Len(t, errs, 1)
 			require.Contains(t, errs[0], tc.errMsg)
 		})
-
 	}
 }
 
@@ -475,8 +473,7 @@ func makeRelayedHosts(t *testing.T, h1opt, h2opt []holepunch.Option, addHolePunc
 		hps = addHolePunchService(t, h2, h2opt...)
 	}
 
-	// h1 has a relay addr
-	// h2 should connect to the relay addr
+	// h2 has a relay addr
 	var raddr ma.Multiaddr
 	for _, a := range h2.Addrs() {
 		if _, err := a.ValueForProtocol(ma.P_CIRCUIT); err == nil {
@@ -485,6 +482,7 @@ func makeRelayedHosts(t *testing.T, h1opt, h2opt []holepunch.Option, addHolePunc
 		}
 	}
 	require.NotEmpty(t, raddr)
+	// h1 should connect to the relay addr
 	require.NoError(t, h1.Connect(context.Background(), peer.AddrInfo{
 		ID:    h2.ID(),
 		Addrs: []ma.Multiaddr{raddr},
@@ -494,7 +492,11 @@ func makeRelayedHosts(t *testing.T, h1opt, h2opt []holepunch.Option, addHolePunc
 
 func addHolePunchService(t *testing.T, h host.Host, opts ...holepunch.Option) *holepunch.Service {
 	t.Helper()
-	hps, err := holepunch.NewService(h, newMockIDService(t, h), opts...)
+	hps, err := holepunch.NewService(h, newMockIDService(t, h), func() []ma.Multiaddr {
+		addrs := h.Addrs()
+		addrs = slices.DeleteFunc(addrs, func(a ma.Multiaddr) bool { return !manet.IsPublicAddr(a) })
+		return append(addrs, ma.StringCast("/ip4/1.2.3.4/tcp/1234"))
+	}, opts...)
 	require.NoError(t, err)
 	return hps
 }
@@ -507,7 +509,6 @@ func mkHostWithHolePunchSvc(t *testing.T, opts ...holepunch.Option) (host.Host, 
 		libp2p.ResourceManager(&network.NullResourceManager{}),
 	)
 	require.NoError(t, err)
-	hps, err := holepunch.NewService(h, newMockIDService(t, h), opts...)
-	require.NoError(t, err)
+	hps := addHolePunchService(t, h, opts...)
 	return h, hps
 }

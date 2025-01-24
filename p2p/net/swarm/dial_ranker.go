@@ -22,11 +22,15 @@ const (
 
 	// RelayDelay is the duration by which relay dials are delayed relative to direct addresses
 	RelayDelay = 500 * time.Millisecond
+
+	// delay for other transport addresses. This will apply to /webrtc-direct.
+	PublicOtherDelay  = 1 * time.Second
+	PrivateOtherDelay = 100 * time.Millisecond
 )
 
 // NoDelayDialRanker ranks addresses with no delay. This is useful for simultaneous connect requests.
 func NoDelayDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
-	return getAddrDelay(addrs, 0, 0, 0)
+	return getAddrDelay(addrs, 0, 0, 0, 0)
 }
 
 // DefaultDialRanker determines the ranking of outgoing connection attempts.
@@ -58,8 +62,22 @@ func NoDelayDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
 //  3. If a QUIC or WebTransport address is present, TCP addresses dials are delayed relative to the last QUIC dial:
 //     We prefer to end up with a QUIC connection. For public addresses, the delay introduced is 250ms (PublicTCPDelay),
 //     and for private addresses 30ms (PrivateTCPDelay).
+//  4. For the TCP addresses we follow a strategy similar to QUIC with an optimisation for handling the long TCP
+//     handshake time described in 6. If both IPv6 TCP and IPv4 TCP addresses are present, we do a Happy Eyeballs
+//     style ranking. First dial the IPv6 TCP address with the lowest port. After this, dial the IPv4 TCP address
+//     with the lowest port delayed by 250ms (PublicTCPDelay) for public addresses, and 30ms (PrivateTCPDelay)
+//     for local addresses. After this we dial all the rest of the addresses delayed by 250ms (PublicTCPDelay) for
+//     public addresses, and 30ms (PrivateTCPDelay) for local addresses.
+//  5. If only one of TCP IPv6 or TCP IPv4 addresses are present, dial the TCP address with the lowest port
+//     first. After this we dial the rest of the TCP addresses delayed by 250ms (PublicTCPDelay) for public
+//     addresses, and 30ms (PrivateTCPDelay) for local addresses.
+//  6. When a TCP socket is connected and awaiting security and muxer upgrade, we stop new dials for 2*PublicTCPDelay
+//     to allow for the upgrade to complete.
+//  7. WebRTC Direct, and other IP transport addresses are dialed 1 second after the last QUIC or TCP dial.
+//     We only ever need to dial these if the peer doesn't have any other transport available, in which
+//     case these are dialed immediately.
 //
-// We dial lowest ports first for QUIC addresses as they are more likely to be the listen port.
+// We dial lowest ports first as they are more likely to be the listen port.
 func DefaultDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
 	relay, addrs := filterAddrs(addrs, isRelayAddr)
 	pvt, addrs := filterAddrs(addrs, manet.IsPrivateAddr)
@@ -72,13 +90,18 @@ func DefaultDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
 	}
 
 	res := make([]network.AddrDelay, 0, len(addrs))
-	for i := 0; i < len(addrs); i++ {
-		res = append(res, network.AddrDelay{Addr: addrs[i], Delay: 0})
+	res = append(res, getAddrDelay(pvt, PrivateTCPDelay, PrivateQUICDelay, PrivateOtherDelay, 0)...)
+	res = append(res, getAddrDelay(public, PublicTCPDelay, PublicQUICDelay, PublicOtherDelay, 0)...)
+	res = append(res, getAddrDelay(relay, PublicTCPDelay, PublicQUICDelay, PublicOtherDelay, relayOffset)...)
+	var maxDelay time.Duration
+	if len(res) > 0 {
+		maxDelay = res[len(res)-1].Delay
 	}
 
-	res = append(res, getAddrDelay(pvt, PrivateTCPDelay, PrivateQUICDelay, 0)...)
-	res = append(res, getAddrDelay(public, PublicTCPDelay, PublicQUICDelay, 0)...)
-	res = append(res, getAddrDelay(relay, PublicTCPDelay, PublicQUICDelay, relayOffset)...)
+	for i := 0; i < len(addrs); i++ {
+		res = append(res, network.AddrDelay{Addr: addrs[i], Delay: maxDelay + PublicOtherDelay})
+	}
+
 	return res
 }
 
@@ -87,23 +110,58 @@ func DefaultDialRanker(addrs []ma.Multiaddr) []network.AddrDelay {
 // offset is used to delay all addresses by a fixed duration. This is useful for delaying all relay
 // addresses relative to direct addresses.
 func getAddrDelay(addrs []ma.Multiaddr, tcpDelay time.Duration, quicDelay time.Duration,
-	offset time.Duration) []network.AddrDelay {
+	otherDelay time.Duration, offset time.Duration) []network.AddrDelay {
+	if len(addrs) == 0 {
+		return nil
+	}
 
 	sort.Slice(addrs, func(i, j int) bool { return score(addrs[i]) < score(addrs[j]) })
 
-	// If the first address is (QUIC, IPv6), make the second address (QUIC, IPv4).
-	happyEyeballs := false
-	if len(addrs) > 0 {
+	// addrs is now sorted by (Transport, IPVersion). Reorder addrs for happy eyeballs dialing.
+	// For QUIC and TCP, if we have both IPv6 and IPv4 addresses, move the
+	// highest priority IPv4 address to the second position.
+	happyEyeballsQUIC := false
+	happyEyeballsTCP := false
+	// tcpStartIdx is the index of the first TCP Address
+	var tcpStartIdx int
+	{
+		i := 0
+		// If the first QUIC address is IPv6 move the first QUIC IPv4 address to second position
 		if isQUICAddr(addrs[0]) && isProtocolAddr(addrs[0], ma.P_IP6) {
-			for i := 1; i < len(addrs); i++ {
-				if isQUICAddr(addrs[i]) && isProtocolAddr(addrs[i], ma.P_IP4) {
-					// make IPv4 address the second element
-					if i > 1 {
-						a := addrs[i]
-						copy(addrs[2:], addrs[1:i])
+			for j := 1; j < len(addrs); j++ {
+				if isQUICAddr(addrs[j]) && isProtocolAddr(addrs[j], ma.P_IP4) {
+					// The first IPv4 address is at position j
+					// Move the jth element at position 1 shifting the affected elements
+					if j > 1 {
+						a := addrs[j]
+						copy(addrs[2:], addrs[1:j])
 						addrs[1] = a
 					}
-					happyEyeballs = true
+					happyEyeballsQUIC = true
+					i = j + 1
+					break
+				}
+			}
+		}
+
+		for tcpStartIdx = i; tcpStartIdx < len(addrs); tcpStartIdx++ {
+			if isProtocolAddr(addrs[tcpStartIdx], ma.P_TCP) {
+				break
+			}
+		}
+
+		// If the first TCP address is IPv6 move the first TCP IPv4 address to second position
+		if tcpStartIdx < len(addrs) && isProtocolAddr(addrs[tcpStartIdx], ma.P_IP6) {
+			for j := tcpStartIdx + 1; j < len(addrs); j++ {
+				if isProtocolAddr(addrs[j], ma.P_TCP) && isProtocolAddr(addrs[j], ma.P_IP4) {
+					// First TCP IPv4 address is at position j, move it to position tcpStartIdx+1
+					// which is the second priority TCP address
+					if j > tcpStartIdx+1 {
+						a := addrs[j]
+						copy(addrs[tcpStartIdx+2:], addrs[tcpStartIdx+1:j])
+						addrs[tcpStartIdx+1] = a
+					}
+					happyEyeballsTCP = true
 					break
 				}
 			}
@@ -111,25 +169,48 @@ func getAddrDelay(addrs []ma.Multiaddr, tcpDelay time.Duration, quicDelay time.D
 	}
 
 	res := make([]network.AddrDelay, 0, len(addrs))
-
-	var totalTCPDelay time.Duration
+	var tcpFirstDialDelay time.Duration
+	var lastQUICOrTCPDelay time.Duration
 	for i, addr := range addrs {
 		var delay time.Duration
 		switch {
 		case isQUICAddr(addr):
-			// For QUIC addresses we dial an IPv6 address, then after quicDelay an IPv4
-			// address, then after quicDelay we dial rest of the addresses.
+			// We dial an IPv6 address, then after quicDelay an IPv4
+			// address, then after a further quicDelay we dial the rest of the addresses.
 			if i == 1 {
 				delay = quicDelay
 			}
-			if i > 1 && happyEyeballs {
-				delay = 2 * quicDelay
-			} else if i > 1 {
-				delay = quicDelay
+			if i > 1 {
+				// If we have happy eyeballs for QUIC, dials after the second position
+				// will be delayed by 2*quicDelay
+				if happyEyeballsQUIC {
+					delay = 2 * quicDelay
+				} else {
+					delay = quicDelay
+				}
 			}
-			totalTCPDelay = delay + tcpDelay
+			lastQUICOrTCPDelay = delay
+			tcpFirstDialDelay = delay + tcpDelay
 		case isProtocolAddr(addr, ma.P_TCP):
-			delay = totalTCPDelay
+			// We dial an IPv6 address, then after tcpDelay an IPv4
+			// address, then after a further tcpDelay we dial the rest of the addresses.
+			if i == tcpStartIdx+1 {
+				delay = tcpDelay
+			}
+			if i > tcpStartIdx+1 {
+				// If we have happy eyeballs for TCP, dials after the second position
+				// will be delayed by 2*tcpDelay
+				if happyEyeballsTCP {
+					delay = 2 * tcpDelay
+				} else {
+					delay = tcpDelay
+				}
+			}
+			delay += tcpFirstDialDelay
+			lastQUICOrTCPDelay = delay
+		// if it's neither quic, webtransport, tcp, or websocket address
+		default:
+			delay = lastQUICOrTCPDelay + otherDelay
 		}
 		res = append(res, network.AddrDelay{Addr: addr, Delay: offset + delay})
 	}
@@ -166,6 +247,9 @@ func score(a ma.Multiaddr) int {
 	if p, err := a.ValueForProtocol(ma.P_TCP); err == nil {
 		pi, _ := strconv.Atoi(p)
 		return ip4Weight + pi + (1 << 20)
+	}
+	if _, err := a.ValueForProtocol(ma.P_WEBRTC_DIRECT); err == nil {
+		return 1 << 21
 	}
 	return (1 << 30)
 }
